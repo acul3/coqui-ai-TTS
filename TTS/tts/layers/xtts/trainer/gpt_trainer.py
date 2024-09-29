@@ -1,4 +1,3 @@
-import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Union
 
@@ -6,8 +5,8 @@ import torch
 import torch.nn as nn
 import torchaudio
 from coqpit import Coqpit
+from torch.nn import functional as F
 from torch.utils.data import DataLoader
-from trainer.io import load_fsspec
 from trainer.torch import DistributedSampler
 from trainer.trainer_utils import get_optimizer, get_scheduler
 
@@ -19,8 +18,7 @@ from TTS.tts.layers.xtts.tokenizer import VoiceBpeTokenizer
 from TTS.tts.layers.xtts.trainer.dataset import XTTSDataset
 from TTS.tts.models.base_tts import BaseTTS
 from TTS.tts.models.xtts import Xtts, XttsArgs, XttsAudioConfig
-
-logger = logging.getLogger(__name__)
+from TTS.utils.io import load_fsspec
 
 
 @dataclass
@@ -60,7 +58,7 @@ def callback_clearml_load_save(operation_type, model_info):
     # return None means skip the file upload/log, returning model_info will continue with the log/upload
     # you can also change the upload destination file name model_info.upload_filename or check the local file size with Path(model_info.local_model_path).stat().st_size
     assert operation_type in ("load", "save")
-    logger.debug("%s %s", operation_type, model_info.__dict__)
+    # print(operation_type, model_info.__dict__)
 
     if "similarities.pth" in model_info.__dict__["local_model_path"]:
         return None
@@ -91,15 +89,16 @@ class GPTTrainer(BaseTTS):
 
         # load GPT if available
         if self.args.gpt_checkpoint:
-            gpt_checkpoint = torch.load(self.args.gpt_checkpoint, map_location=torch.device("cpu"), weights_only=True)
+            gpt_checkpoint = torch.load(self.args.gpt_checkpoint, map_location=torch.device("cpu"))
             # deal with coqui Trainer exported model
             if "model" in gpt_checkpoint.keys() and "config" in gpt_checkpoint.keys():
-                logger.info("Coqui Trainer checkpoint detected! Converting it!")
+                print("Coqui Trainer checkpoint detected! Converting it!")
                 gpt_checkpoint = gpt_checkpoint["model"]
                 states_keys = list(gpt_checkpoint.keys())
                 for key in states_keys:
                     if "gpt." in key:
-                        new_key = key.replace("gpt.", "")
+                        # new_key = key.replace("gpt.", "")
+                        new_key = key[4:]
                         gpt_checkpoint[new_key] = gpt_checkpoint[key]
                         del gpt_checkpoint[key]
                     else:
@@ -113,7 +112,7 @@ class GPTTrainer(BaseTTS):
                 num_new_tokens = (
                     self.xtts.gpt.text_embedding.weight.shape[0] - gpt_checkpoint["text_embedding.weight"].shape[0]
                 )
-                logger.info("Loading checkpoint with %d additional tokens.", num_new_tokens)
+                print(f" > Loading checkpoint with {num_new_tokens} additional tokens.")
 
                 # add new tokens to a linear layer (text_head)
                 emb_g = gpt_checkpoint["text_embedding.weight"]
@@ -140,7 +139,7 @@ class GPTTrainer(BaseTTS):
                 gpt_checkpoint["text_head.bias"] = text_head_bias
 
             self.xtts.gpt.load_state_dict(gpt_checkpoint, strict=True)
-            logger.info("GPT weights restored from: %s", self.args.gpt_checkpoint)
+            print(">> GPT weights restored from:", self.args.gpt_checkpoint)
 
         # Mel spectrogram extractor for conditioning
         if self.args.gpt_use_perceiver_resampler:
@@ -184,9 +183,9 @@ class GPTTrainer(BaseTTS):
 
         self.dvae.eval()
         if self.args.dvae_checkpoint:
-            dvae_checkpoint = torch.load(self.args.dvae_checkpoint, map_location=torch.device("cpu"), weights_only=True)
+            dvae_checkpoint = torch.load(self.args.dvae_checkpoint, map_location=torch.device("cpu"))
             self.dvae.load_state_dict(dvae_checkpoint, strict=False)
-            logger.info("DVAE weights restored from: %s", self.args.dvae_checkpoint)
+            print(">> DVAE weights restored from:", self.args.dvae_checkpoint)
         else:
             raise RuntimeError(
                 "You need to specify config.model_args.dvae_checkpoint path to be able to train the GPT decoder!!"
@@ -232,7 +231,7 @@ class GPTTrainer(BaseTTS):
             # init gpt for inference mode
             self.xtts.gpt.init_gpt_for_inference(kv_cache=self.args.kv_cache, use_deepspeed=False)
             self.xtts.gpt.eval()
-            logger.info("Synthesizing test sentences.")
+            print(" | > Synthesizing test sentences.")
             for idx, s_info in enumerate(self.config.test_sentences):
                 wav = self.xtts.synthesize(
                     s_info["text"],
@@ -393,7 +392,7 @@ class GPTTrainer(BaseTTS):
                 loader = DataLoader(
                     dataset,
                     sampler=sampler,
-                    batch_size=config.eval_batch_size if is_eval else config.batch_size,
+                    batch_size = config.eval_batch_size if is_eval else config.batch_size,
                     collate_fn=dataset.collate_fn,
                     num_workers=config.num_eval_loader_workers if is_eval else config.num_loader_workers,
                     pin_memory=False,
@@ -485,6 +484,40 @@ class GPTTrainer(BaseTTS):
         """Load the model checkpoint and setup for training or inference"""
 
         state = self.xtts.get_compatible_checkpoint_state_dict(checkpoint_path)
+
+        # edit checkpoint if the number of tokens is changed to ensures the better transfer learning possible
+        if (
+            "gpt.text_embedding.weight" in state
+            and state["gpt.text_embedding.weight"].shape != self.xtts.gpt.text_embedding.weight.shape
+        ):
+            num_new_tokens = (
+                self.xtts.gpt.text_embedding.weight.shape[0] - state["gpt.text_embedding.weight"].shape[0]
+            )
+            print(f" > Loading checkpoint with {num_new_tokens} additional tokens.")
+
+            # add new tokens to a linear layer (text_head)
+            emb_g = state["gpt.text_embedding.weight"]
+            new_row = torch.randn(num_new_tokens, emb_g.shape[1])
+            start_token_row = emb_g[-1, :]
+            emb_g = torch.cat([emb_g, new_row], axis=0)
+            emb_g[-1, :] = start_token_row
+            state["gpt.text_embedding.weight"] = emb_g
+
+            # add new weights to the linear layer (text_head)
+            text_head_weight = state["gpt.text_head.weight"]
+            start_token_row = text_head_weight[-1, :]
+            new_entry = torch.randn(num_new_tokens, self.xtts.gpt.text_head.weight.shape[1])
+            text_head_weight = torch.cat([text_head_weight, new_entry], axis=0)
+            text_head_weight[-1, :] = start_token_row
+            state["gpt.text_head.weight"] = text_head_weight
+
+            # add new biases to the linear layer (text_head)
+            text_head_bias = state["gpt.text_head.bias"]
+            start_token_row = text_head_bias[-1]
+            new_bias_entry = torch.zeros(num_new_tokens)
+            text_head_bias = torch.cat([text_head_bias, new_bias_entry], axis=0)
+            text_head_bias[-1] = start_token_row
+            state["gpt.text_head.bias"] = text_head_bias
 
         # load the model weights
         self.xtts.load_state_dict(state, strict=strict)

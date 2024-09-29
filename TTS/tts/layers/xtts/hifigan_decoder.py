@@ -1,5 +1,3 @@
-import logging
-
 import torch
 import torchaudio
 from torch import nn
@@ -7,13 +5,14 @@ from torch.nn import Conv1d, ConvTranspose1d
 from torch.nn import functional as F
 from torch.nn.utils.parametrizations import weight_norm
 from torch.nn.utils.parametrize import remove_parametrizations
-from trainer.io import load_fsspec
 
-from TTS.vocoder.models.hifigan_generator import get_padding
-
-logger = logging.getLogger(__name__)
+from TTS.utils.io import load_fsspec
 
 LRELU_SLOPE = 0.1
+
+
+def get_padding(k, d):
+    return int((k * d - d) / 2)
 
 
 class ResBlock1(torch.nn.Module):
@@ -317,7 +316,7 @@ class HifiganGenerator(torch.nn.Module):
         return self.forward(c)
 
     def remove_weight_norm(self):
-        logger.info("Removing weight norm...")
+        print("Removing weight norm...")
         for l in self.ups:
             remove_parametrizations(l, "weight")
         for l in self.resblocks:
@@ -328,7 +327,7 @@ class HifiganGenerator(torch.nn.Module):
     def load_checkpoint(
         self, config, checkpoint_path, eval=False, cache=False
     ):  # pylint: disable=unused-argument, redefined-builtin
-        state = torch.load(checkpoint_path, map_location=torch.device("cpu"), weights_only=True)
+        state = torch.load(checkpoint_path, map_location=torch.device("cpu"))
         self.load_state_dict(state["model"])
         if eval:
             self.eval()
@@ -391,7 +390,7 @@ def set_init_dict(model_dict, checkpoint_state, c):
     # Partial initialization: if there is a mismatch with new and old layer, it is skipped.
     for k, v in checkpoint_state.items():
         if k not in model_dict:
-            logger.warning("Layer missing in the model definition: %s", k)
+            print(" | > Layer missing in the model definition: {}".format(k))
     # 1. filter out unnecessary keys
     pretrained_dict = {k: v for k, v in checkpoint_state.items() if k in model_dict}
     # 2. filter out different size layers
@@ -402,7 +401,7 @@ def set_init_dict(model_dict, checkpoint_state, c):
             pretrained_dict = {k: v for k, v in pretrained_dict.items() if reinit_layer_name not in k}
     # 4. overwrite entries in the existing state dict
     model_dict.update(pretrained_dict)
-    logger.info("%d / %d layers are restored.", len(pretrained_dict), len(model_dict))
+    print(" | > {} / {} layers are restored.".format(len(pretrained_dict), len(model_dict)))
     return model_dict
 
 
@@ -580,13 +579,13 @@ class ResNetSpeakerEncoder(nn.Module):
         state = load_fsspec(checkpoint_path, map_location=torch.device("cpu"), cache=cache)
         try:
             self.load_state_dict(state["model"])
-            logger.info("Model fully restored.")
+            print(" > Model fully restored. ")
         except (KeyError, RuntimeError) as error:
             # If eval raise the error
             if eval:
                 raise error
 
-            logger.info("Partial model initialization.")
+            print(" > Partial model initialization.")
             model_dict = self.state_dict()
             model_dict = set_init_dict(model_dict, state["model"])
             self.load_state_dict(model_dict)
@@ -597,7 +596,7 @@ class ResNetSpeakerEncoder(nn.Module):
             try:
                 criterion.load_state_dict(state["criterion"])
             except (KeyError, RuntimeError) as error:
-                logger.exception("Criterion load ignored because of: %s", error)
+                print(" > Criterion load ignored because of:", error)
 
         if use_cuda:
             self.cuda()

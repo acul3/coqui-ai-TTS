@@ -1,5 +1,4 @@
 import functools
-import logging
 from math import sqrt
 
 import torch
@@ -8,8 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
 from einops import rearrange
-
-logger = logging.getLogger(__name__)
 
 
 def default(val, d):
@@ -46,7 +43,7 @@ def dvae_wav_to_mel(
     mel = mel_stft(wav)
     mel = torch.log(torch.clamp(mel, min=1e-5))
     if mel_norms is None:
-        mel_norms = torch.load(mel_norms_file, map_location=device, weights_only=True)
+        mel_norms = torch.load(mel_norms_file, map_location=device)
     mel = mel / mel_norms.unsqueeze(0).unsqueeze(-1)
     return mel
 
@@ -82,7 +79,7 @@ class Quantize(nn.Module):
             self.embed_avg = (ea * ~mask + rand_embed).permute(1, 0)
             self.cluster_size = self.cluster_size * ~mask.squeeze()
             if torch.any(mask):
-                logger.info("Reset %d embedding codes.", torch.sum(mask))
+                print(f"Reset {torch.sum(mask)} embedding codes.")
                 self.codes = None
                 self.codes_full = False
 
@@ -263,7 +260,7 @@ class DiscreteVAE(nn.Module):
             dec_init_chan = codebook_dim if not has_resblocks else dec_chans[0]
             dec_chans = [dec_init_chan, *dec_chans]
 
-            enc_chans_io, dec_chans_io = (list(zip(t[:-1], t[1:])) for t in (enc_chans, dec_chans))
+            enc_chans_io, dec_chans_io = map(lambda t: list(zip(t[:-1], t[1:])), (enc_chans, dec_chans))
 
             pad = (kernel_size - 1) // 2
             for (enc_in, enc_out), (dec_in, dec_out) in zip(enc_chans_io, dec_chans_io):
@@ -309,9 +306,9 @@ class DiscreteVAE(nn.Module):
         if not self.normalization is not None:
             return images
 
-        means, stds = (torch.as_tensor(t).to(images) for t in self.normalization)
+        means, stds = map(lambda t: torch.as_tensor(t).to(images), self.normalization)
         arrange = "c -> () c () ()" if self.positional_dims == 2 else "c -> () c ()"
-        means, stds = (rearrange(t, arrange) for t in (means, stds))
+        means, stds = map(lambda t: rearrange(t, arrange), (means, stds))
         images = images.clone()
         images.sub_(means).div_(stds)
         return images
